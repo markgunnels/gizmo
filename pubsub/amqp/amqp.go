@@ -98,12 +98,16 @@ type AMQPSubscriber struct {
 	cfg  Config
 	conn *amqp.Connection
 	chn  *amqp.Channel
+	stop chan *amqp.Error
+	err  Error
 }
 
 func NewAMQPSubscriber(cfg Config) (pubsub.Subscriber, error) {
 	sub := &AMQPSubscriber{}
-
 	var err error
+
+	sub.stop = make(chan *amqp.Error)
+
 	sub.conn, err = amqp.Dial(cfg.URL())
 	if err != nil {
 		Log.Error("unable to connect to AMQP: ", err)
@@ -116,7 +120,6 @@ func NewAMQPSubscriber(cfg Config) (pubsub.Subscriber, error) {
 		return sub, err
 	}
 
-	// make sure the queue is there :)
 	_, err = sub.chn.QueueDeclare(
 		cfg.Queue,
 		cfg.Durable,
@@ -134,21 +137,61 @@ func NewAMQPSubscriber(cfg Config) (pubsub.Subscriber, error) {
 
 // Start will return a channel of raw messages.
 func (s *AMQPSubscriber) Start() <-chan SubscriberMessage {
-	msgs, err := s.chn.Consume(
-		s.cfg.Queue,     // queue
-		"",              // consumer
-		false,           // auto-ack
-		s.cfg.Exclusive, // exclusive
-		false,           // no-local
-		s.cfg.NoWait,    // no-wait
-		nil,             // args
-	)
+	c := make(chan SubscriberMessage)
+
+	go func() {
+		msgs, err := s.chn.Consume(
+			s.cfg.Queue,     // queue
+			"",              // consumer
+			false,           // auto-ack
+			s.cfg.Exclusive, // exclusive
+			false,           // no-local
+			s.cfg.NoWait,    // no-wait
+			nil,             // args
+		)
+
+		if err != nil {
+			s.err = err
+			return
+		}
+
+		for {
+			select {
+			case msg := <-msgs:
+				c <- &subMessage{msg}
+				continue
+			case amqpErr := <-s.stop:
+				s.err = amqpErr
+				close(c)
+				return
+			}
+		}
+	}()
+
+	return c
 }
 
 // // Err will contain any errors returned from the consumer connection.
-// Err() error
+func (s *subscriber) Err() error {
+	return s.err
+}
+
 // // Stop will initiate a graceful shutdown of the subscriber connection.
-// Stop() error
+func (s *subscriber) Stop() error {
+	err := s.chn.Close()
+	if err != nil {
+		s.err = err
+		return err
+	}
+
+	err := s.conn.Close()
+	if err != nil {
+		s.err = err
+		return err
+	}
+
+	return nil
+}
 
 // SubscriberMessage is a struct to encapsulate subscriber messages and provide
 // a mechanism for acknowledging messages _after_ they've been processed.
@@ -156,8 +199,14 @@ type subMessage struct {
 	message *amqp.Delivery
 }
 
-type SubscriberMessage interface {
-	Message() []byte
-	ExtendDoneDeadline(time.Duration) error
-	Done() error
+func (m *subMessage) Message() []byte {
+	return m.subMessage.Body
+}
+
+func (m *subMessage) Done() error {
+	return m.subMessage.Ack(false)
+}
+
+func (m *subMessage) ExtendDoneDeadline(time.Duration) error {
+	return nil
 }
