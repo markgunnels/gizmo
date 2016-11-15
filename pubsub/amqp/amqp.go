@@ -1,8 +1,9 @@
 package amqp
 
 import (
-	"fmt"
 	"time"
+
+	"golang.org/x/net/context"
 
 	"github.com/golang/protobuf/proto"
 	"github.com/streadway/amqp"
@@ -11,19 +12,7 @@ import (
 	"github.com/NYTimes/gizmo/web"
 )
 
-// URL will return the connection URL AMQP
-func (c Config) URL() string {
-	return fmt.Sprintf("amqp://%s:%s@%s:%d/",
-		a.User,
-		a.Pw,
-		a.Host,
-		a.Port,
-	)
-}
-
 type AMQPPublisher struct {
-	crypt *Encrypter
-
 	cfg  Config
 	conn *amqp.Connection
 	chn  *amqp.Channel
@@ -33,47 +22,47 @@ func NewAMQPPublisher(cfg Config) (pubsub.Publisher, error) {
 	pub := &AMQPPublisher{}
 
 	var err error
-	pub.conn, err = amqp.Dial(cfg.URL())
+	pub.conn, err = amqp.Dial(cfg.URL)
 	if err != nil {
-		Log.Error("unable to connect to AMQP: ", err)
+		//		Log.Error("unable to connect to AMQP: ", err)
 		return pub, err
 	}
 
 	pub.chn, err = pub.conn.Channel()
 	if err != nil {
-		Log.Error("unable to get to AMQP channel: ", err)
+		//		Log.Error("unable to get to AMQP channel: ", err)
 		return pub, err
 	}
 
 	// make sure the topic is there :)
-	err = ch.ExchangeDeclare(
+	err = pub.chn.ExchangeDeclare(
 		cfg.Topic,      // name
 		"topic",        // type
 		cfg.Durable,    // durable
 		cfg.AutoDelete, // auto-deleted
 		false,          // internal
-		cfg.NowWait,    // no-wait
+		cfg.NoWait,     // no-wait
 		nil,            // arguments
 	)
 
 	if err != nil {
-		Log.Error("unable to declare AMQP topic: ", err)
+		//		Log.Error("unable to declare AMQP topic: ", err)
 	}
 
 	return pub, err
 }
 
 // Publish will marshal the proto message and emit it to the AMQP topic.
-func (p *AMQPPublisher) Publish(key string, m proto.Message) error {
+func (p *AMQPPublisher) Publish(context context.Context, key string, m proto.Message) error {
 	mb, err := proto.Marshal(m)
 	if err != nil {
 		return err
 	}
-	return p.PublishRaw(key, mb)
+	return p.PublishRaw(context, key, mb)
 }
 
 // Publish will emit the byte array to the AMQP topic.
-func (p *AMQPPublisher) PublishRaw(key string, m []byte) error {
+func (p *AMQPPublisher) PublishRaw(context context.Context, key string, m []byte) error {
 	msg := amqp.Publishing{
 		DeliveryMode: p.cfg.DeliveryMode,
 		Timestamp:    time.Now(),
@@ -81,7 +70,12 @@ func (p *AMQPPublisher) PublishRaw(key string, m []byte) error {
 		Body:         m,
 	}
 
-	return p.chn.Publish("", p.cfg.Topic, AMQPMandatory, AMQPImmediate, msg)
+	return p.chn.Publish("",
+		p.cfg.Topic,
+		p.cfg.Mandatory,
+		p.cfg.Immediate,
+		msg)
+
 }
 
 // Stop will close the AMQP channel and connection
@@ -99,7 +93,7 @@ type AMQPSubscriber struct {
 	conn *amqp.Connection
 	chn  *amqp.Channel
 	stop chan *amqp.Error
-	err  Error
+	err  error
 }
 
 func NewAMQPSubscriber(cfg Config) (pubsub.Subscriber, error) {
@@ -108,17 +102,19 @@ func NewAMQPSubscriber(cfg Config) (pubsub.Subscriber, error) {
 
 	sub.stop = make(chan *amqp.Error)
 
-	sub.conn, err = amqp.Dial(cfg.URL())
+	sub.conn, err = amqp.Dial(cfg.URL)
 	if err != nil {
-		Log.Error("unable to connect to AMQP: ", err)
+		//		Log.Error("unable to connect to AMQP: ", err)
 		return sub, err
 	}
-
+	sub.conn.NotifyClose(sub.stop)
+	
 	sub.chn, err = sub.conn.Channel()
 	if err != nil {
-		Log.Error("unable to get to AMQP channel: ", err)
+		//		Log.Error("unable to get to AMQP channel: ", err)
 		return sub, err
 	}
+	sub.chn.NotifyClose(sub.stop)
 
 	_, err = sub.chn.QueueDeclare(
 		cfg.Queue,
@@ -128,7 +124,7 @@ func NewAMQPSubscriber(cfg Config) (pubsub.Subscriber, error) {
 		cfg.NoWait,
 		nil)
 	if err != nil {
-		Log.Error("unable to declare AMQP queue: ", err)
+		//		Log.Error("unable to declare AMQP queue: ", err)
 		return sub, err
 	}
 
@@ -136,8 +132,8 @@ func NewAMQPSubscriber(cfg Config) (pubsub.Subscriber, error) {
 }
 
 // Start will return a channel of raw messages.
-func (s *AMQPSubscriber) Start() <-chan SubscriberMessage {
-	c := make(chan SubscriberMessage)
+func (s *AMQPSubscriber) Start() <-chan pubsub.SubscriberMessage {
+	c := make(chan pubsub.SubscriberMessage)
 
 	go func() {
 		msgs, err := s.chn.Consume(
@@ -172,19 +168,19 @@ func (s *AMQPSubscriber) Start() <-chan SubscriberMessage {
 }
 
 // // Err will contain any errors returned from the consumer connection.
-func (s *subscriber) Err() error {
+func (s *AMQPSubscriber) Err() error {
 	return s.err
 }
 
 // // Stop will initiate a graceful shutdown of the subscriber connection.
-func (s *subscriber) Stop() error {
+func (s *AMQPSubscriber) Stop() error {
 	err := s.chn.Close()
 	if err != nil {
 		s.err = err
 		return err
 	}
 
-	err := s.conn.Close()
+	err = s.conn.Close()
 	if err != nil {
 		s.err = err
 		return err
@@ -196,15 +192,15 @@ func (s *subscriber) Stop() error {
 // SubscriberMessage is a struct to encapsulate subscriber messages and provide
 // a mechanism for acknowledging messages _after_ they've been processed.
 type subMessage struct {
-	message *amqp.Delivery
+	message amqp.Delivery
 }
 
 func (m *subMessage) Message() []byte {
-	return m.subMessage.Body
+	return m.message.Body
 }
 
 func (m *subMessage) Done() error {
-	return m.subMessage.Ack(false)
+	return m.message.Ack(false)
 }
 
 func (m *subMessage) ExtendDoneDeadline(time.Duration) error {
