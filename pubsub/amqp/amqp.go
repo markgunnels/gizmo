@@ -2,6 +2,7 @@ package amqp
 
 import (
 	"time"
+	"fmt"
 
 	"golang.org/x/net/context"
 
@@ -19,21 +20,25 @@ type AMQPPublisher struct {
 }
 
 func NewAMQPPublisher(cfg Config) (pubsub.Publisher, error) {
-	pub := &AMQPPublisher{}
+	pub := &AMQPPublisher{cfg: cfg}
 
 	var err error
 	pub.conn, err = amqp.Dial(cfg.URL)
 	if err != nil {
-		//		Log.Error("unable to connect to AMQP: ", err)
+		fmt.Println("unable to connect to AMQP: ", err)
 		return pub, err
 	}
 
 	pub.chn, err = pub.conn.Channel()
 	if err != nil {
-		//		Log.Error("unable to get to AMQP channel: ", err)
+		fmt.Println("unable to get to AMQP channel: ", err)
 		return pub, err
 	}
-
+	
+	fmt.Println(cfg.Topic)
+	fmt.Println(cfg.Durable)
+	fmt.Println(cfg.NoWait)
+	
 	// make sure the topic is there :)
 	err = pub.chn.ExchangeDeclare(
 		cfg.Topic,      // name
@@ -46,7 +51,7 @@ func NewAMQPPublisher(cfg Config) (pubsub.Publisher, error) {
 	)
 
 	if err != nil {
-		//		Log.Error("unable to declare AMQP topic: ", err)
+		fmt.Println("unable to declare AMQP topic: ", err)
 	}
 
 	return pub, err
@@ -63,6 +68,9 @@ func (p *AMQPPublisher) Publish(context context.Context, key string, m proto.Mes
 
 // Publish will emit the byte array to the AMQP topic.
 func (p *AMQPPublisher) PublishRaw(context context.Context, key string, m []byte) error {
+	fmt.Println(p.cfg.Topic)
+	fmt.Println(p.cfg.Immediate)
+	
 	msg := amqp.Publishing{
 		DeliveryMode: p.cfg.DeliveryMode,
 		Timestamp:    time.Now(),
@@ -70,18 +78,12 @@ func (p *AMQPPublisher) PublishRaw(context context.Context, key string, m []byte
 		Body:         m,
 	}
 
-	return p.chn.Publish("",
-		p.cfg.Topic,
+	return p.chn.Publish(p.cfg.Topic,
+		key,
 		p.cfg.Mandatory,
 		p.cfg.Immediate,
 		msg)
 
-}
-
-// Stop will close the AMQP channel and connection
-func (p *AMQPPublisher) Stop() error {
-	p.chn.Close()
-	return p.conn.Close()
 }
 
 // Subscriber is a generic interface to encapsulate how we want our subscribers
@@ -97,7 +99,7 @@ type AMQPSubscriber struct {
 }
 
 func NewAMQPSubscriber(cfg Config) (pubsub.Subscriber, error) {
-	sub := &AMQPSubscriber{}
+	sub := &AMQPSubscriber{cfg: cfg}
 	var err error
 
 	sub.stop = make(chan *amqp.Error)
